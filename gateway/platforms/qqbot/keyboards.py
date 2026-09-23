@@ -1,7 +1,9 @@
 """QQ Bot inline keyboards + approval / update-prompt helpers. A button click dispatches an
 ``INTERACTION_CREATE`` event carrying the button's ``data``; the bot must ACK promptly via
 ``PUT /interactions/{id}`` or the user sees an error indicator. ``button_data`` formats:
-``approve:<session_key>:<decision>`` (allow-once|allow-always|deny) and ``update_prompt:<answer>`` (y|n).
+``approve:<session_key>:<decision>`` (allow-once|allow-always|deny), ``update_prompt:<answer>`` (y|n),
+``slash_confirm:<session_key>:<confirm_id>:<choice>`` (once|always|cancel) and
+``clarify:<session_key>:<clarify_id>:<option>`` (``c<idx>`` positional choice or ``other``).
 Ported from WideLee's qqbot-agent-sdk v1.2.2 (authorship via Co-authored-by)."""
 
 from __future__ import annotations
@@ -12,10 +14,16 @@ from typing import Any, Dict, List, Optional
 
 APPROVAL_BUTTON_PREFIX = "approve:"
 UPDATE_PROMPT_PREFIX = "update_prompt:"
+SLASH_CONFIRM_BUTTON_PREFIX = "slash_confirm:"
+CLARIFY_BUTTON_PREFIX = "clarify:"
 
 # session_key may itself contain colons (agent:main:qqbot:c2c:OPENID): greedy group, decision trails.
 _APPROVAL_DATA_RE = re.compile(r"^approve:(.+):(allow-once|allow-always|deny)$")
 _UPDATE_PROMPT_RE = re.compile(r"^update_prompt:(y|n)$")
+# Same greedy session_key slot; then the confirm id (colon-free) and the choice.
+_SLASH_CONFIRM_DATA_RE = re.compile(r"^slash_confirm:(.+):([^:]+):(once|always|cancel)$")
+# Same again; then the clarify id and a positional token (c<idx>) or "other".
+_CLARIFY_DATA_RE = re.compile(r"^clarify:(.+):([^:]+):(c\d+|other)$")
 
 def _to_dict(value: Any) -> Any:
     """Serialize a dataclass tree in field-declaration order (the wire shape)."""
@@ -87,6 +95,19 @@ def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
     return m.group(1) if (m := _UPDATE_PROMPT_RE.match(button_data or "")) else None
 
 
+def parse_slash_confirm_button_data(button_data: str) -> Optional[tuple[str, str, str]]:
+    """Parse slash-confirm ``button_data`` into ``(session_key, confirm_id, choice)`` or ``None``."""
+    m = _SLASH_CONFIRM_DATA_RE.match(button_data or "")
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def parse_clarify_button_data(button_data: str) -> Optional[tuple[str, str, str]]:
+    """Parse clarify ``button_data`` into ``(session_key, clarify_id, option)`` or ``None``
+    (``option`` is ``"c<idx>"``, a zero-based choice index, or ``"other"``)."""
+    m = _CLARIFY_DATA_RE.match(button_data or "")
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
 def _single_row_keyboard(group_id: str, *buttons: tuple) -> InlineKeyboard:
     """One row of callback buttons from ``(id, label, visited_label, data, style)`` tuples."""
     row = KeyboardRow(buttons=[
@@ -111,6 +132,68 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
     """Build a Yes/No keyboard for update confirmation prompts."""
     return _single_row_keyboard("update_prompt", ("yes", "✓ 确认", "已确认", f"{UPDATE_PROMPT_PREFIX}y", 1),
                                 ("no", "✗ 取消", "已取消", f"{UPDATE_PROMPT_PREFIX}n", 0))
+
+
+#: QQ rejects keyboards with more than 5 rows (each row up to 5 buttons).
+_MAX_KEYBOARD_ROWS = 5
+#: Clarify choice buttons carry their text as the label; clamp so mobile rows stay readable.
+_MAX_BUTTON_LABEL = 24
+#: Choice lists longer than this drop the extra buttons (ten fills five rows of two); the
+#: typed-number reply still reaches every option.
+_MAX_BUTTON_CHOICES = 10
+
+
+def _truncate_label(label: str, limit: int = _MAX_BUTTON_LABEL) -> str:
+    """Clamp a button label so long option text cannot blow the mobile row width."""
+    label = str(label).strip()
+    return label if len(label) <= limit else label[: limit - 1].rstrip() + "…"
+
+
+def build_slash_confirm_keyboard(session_key: str, confirm_id: str) -> InlineKeyboard:
+    """Build ``[✅ 批准一次] [⭐ 始终批准] [❌ 取消]`` for a destructive slash command (one group, so a
+    click greys the rest). *session_key* and *confirm_id* ride in ``button_data`` so the click can
+    authorize against the session and resolve exactly the pending confirmation."""
+    prefix = f"{SLASH_CONFIRM_BUTTON_PREFIX}{session_key}:{confirm_id}"
+    return _single_row_keyboard(
+        "slash_confirm",
+        ("once", "✅ 批准一次", "已批准", f"{prefix}:once", 1),
+        ("always", "⭐ 始终批准", "已始终批准", f"{prefix}:always", 1),
+        ("cancel", "❌ 取消", "已取消", f"{prefix}:cancel", 0))
+
+
+def build_clarify_keyboard(session_key: str, clarify_id: str, choices: List[Any]) -> InlineKeyboard:
+    """Build one button per choice plus ``✏️ 其它（直接输入）`` for a multiple-choice clarify.
+
+    Choice text is arbitrary UTF-8 (and would blow the callback budget), so only the *label*
+    carries it: ``button_data`` stays positional (``c<idx>``) and the click handler maps the
+    index back to the choice text via the pending clarify entry. One choice per row up to four,
+    two per row beyond that; the Other button gets its own row when there is room (QQ caps
+    keyboards at five rows) and shares the last one otherwise.
+    """
+    prefix = f"{CLARIFY_BUTTON_PREFIX}{session_key}:{clarify_id}"
+    labels = [_truncate_label(str(c).strip() or f"选项 {i + 1}")
+              for i, c in enumerate(list(choices)[:_MAX_BUTTON_CHOICES])]
+    per_row = 1 if len(labels) <= 4 else 2
+    rows = [
+        KeyboardRow(buttons=[
+            KeyboardButton(
+                id=f"c{idx}", group_id="clarify",
+                action=KeyboardButtonAction(type=1, data=f"{prefix}:c{idx}"),
+                render_data=KeyboardButtonRenderData(
+                    label=f"{idx + 1}. {labels[idx]}", visited_label="已选择", style=1))
+            for idx in range(start, min(start + per_row, len(labels)))
+        ])
+        for start in range(0, len(labels), per_row)
+    ]
+    other = KeyboardButton(
+        id="other", group_id="clarify",
+        action=KeyboardButtonAction(type=1, data=f"{prefix}:other"),
+        render_data=KeyboardButtonRenderData(label="✏️ 其它（直接输入）", visited_label="待输入", style=0))
+    if len(rows) < _MAX_KEYBOARD_ROWS:
+        rows.append(KeyboardRow(buttons=[other]))
+    else:
+        rows[-1].buttons.append(other)
+    return InlineKeyboard(content=KeyboardContent(rows=rows))
 
 
 @dataclass
