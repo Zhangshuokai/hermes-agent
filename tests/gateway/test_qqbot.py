@@ -1092,6 +1092,342 @@ class TestSendUpdatePrompt:
 
 
 # ---------------------------------------------------------------------------
+# Clarify + slash-confirm button flows (gateway contract)
+# ---------------------------------------------------------------------------
+
+class TestSlashConfirmButtonData:
+    def test_parse_roundtrip(self):
+        from gateway.platforms.qqbot.keyboards import parse_slash_confirm_button_data
+        parsed = parse_slash_confirm_button_data(
+            "slash_confirm:agent:main:qqbot:dm:u-1:7:always")
+        assert parsed == ("agent:main:qqbot:dm:u-1", "7", "always")
+
+    def test_parse_rejects_other_payloads(self):
+        from gateway.platforms.qqbot.keyboards import parse_slash_confirm_button_data
+        assert parse_slash_confirm_button_data("approve:x:deny") is None
+        assert parse_slash_confirm_button_data("slash_confirm:x:7:nope") is None
+        assert parse_slash_confirm_button_data("slash_confirm:x:once") is None
+        assert parse_slash_confirm_button_data("") is None
+
+
+class TestClarifyButtonData:
+    def test_parse_choice_and_other(self):
+        from gateway.platforms.qqbot.keyboards import parse_clarify_button_data
+        parsed = parse_clarify_button_data(
+            "clarify:agent:main:qqbot:dm:u-1:ab12cd34ef:c2")
+        assert parsed == ("agent:main:qqbot:dm:u-1", "ab12cd34ef", "c2")
+        parsed_other = parse_clarify_button_data(
+            "clarify:agent:main:qqbot:dm:u-1:ab12cd34ef:other")
+        assert parsed_other == ("agent:main:qqbot:dm:u-1", "ab12cd34ef", "other")
+
+    def test_parse_rejects_unknown_option(self):
+        from gateway.platforms.qqbot.keyboards import parse_clarify_button_data
+        assert parse_clarify_button_data("clarify:x:y:zebra") is None
+        assert parse_clarify_button_data("update_prompt:y") is None
+
+
+class TestBuildSlashConfirmKeyboard:
+    def test_three_buttons_embed_session_and_confirm(self):
+        from gateway.platforms.qqbot.keyboards import build_slash_confirm_keyboard
+        kb = build_slash_confirm_keyboard("agent:main:qqbot:dm:u-1", "3")
+        datas = [b.action.data for b in kb.content.rows[0].buttons]
+        assert datas == [
+            "slash_confirm:agent:main:qqbot:dm:u-1:3:once",
+            "slash_confirm:agent:main:qqbot:dm:u-1:3:always",
+            "slash_confirm:agent:main:qqbot:dm:u-1:3:cancel"]
+
+
+class TestBuildClarifyKeyboard:
+    def test_one_button_per_choice_plus_other(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+        kb = build_clarify_keyboard("agent:main:qqbot:dm:u-1", "id1", ["甲", "乙", "丙"])
+        rows = kb.content.rows
+        assert len(rows) == 4  # 3 choices + Other
+        assert rows[0].buttons[0].action.data == "clarify:agent:main:qqbot:dm:u-1:id1:c0"
+        assert rows[2].buttons[0].action.data == "clarify:agent:main:qqbot:dm:u-1:id1:c2"
+        assert rows[3].buttons[0].action.data == "clarify:agent:main:qqbot:dm:u-1:id1:other"
+        assert rows[0].buttons[0].render_data.label == "1. 甲"
+
+    def test_long_choices_truncate_and_pack_two_per_row(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+        kb = build_clarify_keyboard("s", "id", ["长" * 50] * 6)
+        rows = kb.content.rows
+        assert len(rows) == 4  # 6 choices at two per row + Other
+        assert len(rows[0].buttons) == 2
+        assert len(rows[0].buttons[0].render_data.label) <= 27  # clamp + "N. " prefix
+        assert rows[-1].buttons[-1].action.data.endswith(":other")
+
+    def test_more_than_ten_choices_stay_within_five_rows(self):
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+        kb = build_clarify_keyboard("s", "id", [f"opt{i}" for i in range(14)])
+        rows = kb.content.rows
+        assert len(rows) <= 5
+        # The Other button shares the last row when all five rows are full.
+        assert rows[-1].buttons[-1].action.data.endswith(":other")
+
+
+class TestClarifyAndSlashConfirmDispatch:
+    """Clicks on the new buttons resolve through the default dispatcher."""
+
+    def _make_adapter(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    @staticmethod
+    def _event(button_data, operator="u-1", chat_type=2):
+        from gateway.platforms.qqbot.keyboards import parse_interaction_event
+        if chat_type == 2:
+            return parse_interaction_event({
+                "id": "i", "chat_type": 2, "user_openid": operator,
+                "data": {"resolved": {"button_data": button_data}},
+            })
+        return parse_interaction_event({
+            "id": "i", "chat_type": 1, "group_openid": "g-1",
+            "group_member_openid": operator,
+            "data": {"resolved": {"button_data": button_data}},
+        })
+
+    @pytest.mark.asyncio
+    async def test_clarify_click_resolves_with_choice_text(self):
+        adapter = self._make_adapter()
+        resolved = []
+        import tools.clarify_gateway as cg
+
+        class _Entry:
+            choices = ["新端重建", "旧站过渡"]
+
+        orig_resolve = cg.resolve_gateway_clarify
+        cg.resolve_gateway_clarify = lambda cid, resp: (resolved.append((cid, resp)) or True)
+        cg._entries["abc123"] = _Entry()  # type: ignore[index]
+        try:
+            event = self._event("clarify:agent:main:qqbot:dm:u-1:abc123:c1")
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            cg.resolve_gateway_clarify = orig_resolve
+            cg._entries.pop("abc123", None)
+        assert resolved == [("abc123", "旧站过渡")]
+
+    @pytest.mark.asyncio
+    async def test_clarify_other_flips_to_text_capture_and_acks(self):
+        adapter = self._make_adapter()
+        acks = []
+
+        async def fake_ack(event, text):
+            acks.append(text)
+
+        adapter._send_interaction_ack = fake_ack  # type: ignore[assignment]
+        import tools.clarify_gateway as cg
+
+        class _Entry:
+            choices = ["甲", "乙"]
+            awaiting_text = False
+
+        entry = _Entry()
+        cg._entries["flip1"] = entry  # type: ignore[index]
+        try:
+            event = self._event("clarify:agent:main:qqbot:dm:u-1:flip1:other")
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            cg._entries.pop("flip1", None)
+        assert entry.awaiting_text is True
+        assert acks and "输入" in acks[0]
+
+    @pytest.mark.asyncio
+    async def test_expired_clarify_click_gets_notice(self):
+        adapter = self._make_adapter()
+        acks = []
+
+        async def fake_ack(event, text):
+            acks.append(text)
+
+        adapter._send_interaction_ack = fake_ack  # type: ignore[assignment]
+        event = self._event("clarify:agent:main:qqbot:dm:u-1:gone000000:c0")
+        await adapter._default_interaction_dispatch(event)
+        assert acks and "失效" in acks[0]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_clarify_click_rejected(self):
+        adapter = self._make_adapter()
+        resolved = []
+        import tools.clarify_gateway as cg
+
+        class _Entry:
+            choices = ["甲"]
+
+        orig_resolve = cg.resolve_gateway_clarify
+        cg.resolve_gateway_clarify = lambda cid, resp: (resolved.append((cid, resp)) or True)
+        cg._entries["abc123"] = _Entry()  # type: ignore[index]
+        try:
+            event = self._event(
+                "clarify:agent:main:qqbot:group:g-1:owner:abc123:c0", operator="attacker", chat_type=1)
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            cg.resolve_gateway_clarify = orig_resolve
+            cg._entries.pop("abc123", None)
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_click_resolves_and_acks_with_result(self):
+        adapter = self._make_adapter()
+        acks = []
+
+        async def fake_ack(event, text):
+            acks.append(text)
+
+        adapter._send_interaction_ack = fake_ack  # type: ignore[assignment]
+        import tools.slash_confirm as sc
+        calls = []
+
+        async def fake_resolve(session_key, confirm_id, choice):
+            calls.append((session_key, confirm_id, choice))
+            return "🟡 /new 已取消，对话未变。"
+
+        orig_resolve, orig_get = sc.resolve, sc.get_pending
+        sc.resolve = fake_resolve
+        sc.get_pending = lambda sk: {"confirm_id": "5", "command": "/new"}
+        try:
+            event = self._event("slash_confirm:agent:main:qqbot:dm:u-1:5:cancel")
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            sc.resolve, sc.get_pending = orig_resolve, orig_get
+        assert calls == [("agent:main:qqbot:dm:u-1", "5", "cancel")]
+        assert acks == ["🟡 /new 已取消，对话未变。"]
+
+    @pytest.mark.asyncio
+    async def test_stale_slash_confirm_click_gets_notice_without_resolving(self):
+        adapter = self._make_adapter()
+        acks = []
+
+        async def fake_ack(event, text):
+            acks.append(text)
+
+        adapter._send_interaction_ack = fake_ack  # type: ignore[assignment]
+        import tools.slash_confirm as sc
+        calls = []
+
+        async def fake_resolve(session_key, confirm_id, choice):
+            calls.append((session_key, confirm_id, choice))
+            return "should not run"
+
+        orig_resolve, orig_get = sc.resolve, sc.get_pending
+        sc.resolve = fake_resolve
+        sc.get_pending = lambda sk: None  # gone (timeout / resolved elsewhere)
+        try:
+            event = self._event("slash_confirm:agent:main:qqbot:dm:u-1:5:once")
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            sc.resolve, sc.get_pending = orig_resolve, orig_get
+        assert calls == []
+        assert acks and "失效" in acks[0]
+
+    @pytest.mark.asyncio
+    async def test_stale_approval_click_gets_notice(self):
+        adapter = self._make_adapter()
+        acks = []
+
+        async def fake_ack(event, text):
+            acks.append(text)
+
+        adapter._send_interaction_ack = fake_ack  # type: ignore[assignment]
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = lambda sk, ch, resolve_all=False: 0
+        try:
+            event = self._event("approve:agent:main:qqbot:dm:u-1:allow-once")
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+        assert acks and "失效" in acks[0]
+
+
+class TestSendClarifyKeyboard:
+    """send_clarify: buttons with choices; base text for open-ended; failure propagates."""
+
+    def _make_adapter(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    @pytest.mark.asyncio
+    async def test_buttons_sent_with_choice_keyboard(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_swk(chat_id, content, keyboard, reply_to=None):
+            from gateway.platforms.base import SendResult
+            captured.update(chat_id=chat_id, content=content, keyboard=keyboard, reply_to=reply_to)
+            return SendResult(success=True, message_id="m")
+
+        adapter.send_with_keyboard = fake_swk  # type: ignore[assignment]
+        adapter._last_msg_id["u-1"] = "in-9"
+        result = await adapter.send_clarify(
+            chat_id="u-1", question="选哪个方案？", choices=["甲", "乙"],
+            clarify_id="id1", session_key="agent:main:qqbot:dm:u-1")
+        assert result.success
+        assert "选哪个方案？" in captured["content"]
+        assert captured["reply_to"] == "in-9"
+        datas = [b.action.data for row in captured["keyboard"].content.rows for b in row.buttons]
+        assert datas == [
+            "clarify:agent:main:qqbot:dm:u-1:id1:c0",
+            "clarify:agent:main:qqbot:dm:u-1:id1:c1",
+            "clarify:agent:main:qqbot:dm:u-1:id1:other"]
+
+    @pytest.mark.asyncio
+    async def test_open_ended_delegates_to_base_text(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            from gateway.platforms.base import SendResult
+            captured["content"] = content
+            return SendResult(success=True)
+
+        adapter.send = fake_send  # type: ignore[assignment]
+        result = await adapter.send_clarify(
+            chat_id="u-1", question="随便说说你的想法", choices=None,
+            clarify_id="id1", session_key="agent:main:qqbot:dm:u-1")
+        assert result.success
+        assert "随便说说你的想法" in captured["content"]
+
+    @pytest.mark.asyncio
+    async def test_send_failure_returned_for_gateway_fallback(self):
+        adapter = self._make_adapter()
+
+        async def fake_swk(chat_id, content, keyboard, reply_to=None):
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error="Inline keyboards not supported", retryable=False)
+
+        adapter.send_with_keyboard = fake_swk  # type: ignore[assignment]
+        result = await adapter.send_clarify(
+            chat_id="g", question="q", choices=["a"],
+            clarify_id="id1", session_key="agent:main:qqbot:guild:g")
+        assert not result.success  # the clarify-delivery machinery retries the base text once
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_buttons_embed_ids(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_swk(chat_id, content, keyboard, reply_to=None):
+            from gateway.platforms.base import SendResult
+            captured.update(content=content, keyboard=keyboard, reply_to=reply_to)
+            return SendResult(success=True, message_id="m")
+
+        adapter.send_with_keyboard = fake_swk  # type: ignore[assignment]
+        adapter._last_msg_id["u-1"] = "in-3"
+        result = await adapter.send_slash_confirm(
+            chat_id="u-1", title="Confirm /new", message="body text",
+            session_key="agent:main:qqbot:dm:u-1", confirm_id="7")
+        assert result.success
+        assert "Confirm /new" in captured["content"] and "body text" in captured["content"]
+        assert captured["reply_to"] == "in-3"
+        datas = [b.action.data for b in captured["keyboard"].content.rows[0].buttons]
+        assert datas == [
+            "slash_confirm:agent:main:qqbot:dm:u-1:7:once",
+            "slash_confirm:agent:main:qqbot:dm:u-1:7:always",
+            "slash_confirm:agent:main:qqbot:dm:u-1:7:cancel"]
+
+
+# ---------------------------------------------------------------------------
 # _send_identify includes INTERACTION intent
 # ---------------------------------------------------------------------------
 
