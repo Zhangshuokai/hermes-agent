@@ -72,8 +72,9 @@ from gateway.platforms.qqbot.chunked_upload import (
     ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError)
 from gateway.platforms.qqbot.keyboards import (
     ApprovalRequest, InlineKeyboard, InteractionEvent, build_approval_keyboard,
-    build_update_prompt_keyboard, parse_approval_button_data, parse_interaction_event,
-    parse_update_prompt_button_data)
+    build_clarify_keyboard, build_slash_confirm_keyboard, build_update_prompt_keyboard,
+    parse_approval_button_data, parse_clarify_button_data, parse_interaction_event,
+    parse_slash_confirm_button_data, parse_update_prompt_button_data)
 from gateway.platforms._shared import get_scoped_secret as _resolve_qq_secret
 
 
@@ -639,6 +640,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     # Button decision → ``choice`` for tools.approval.resolve_gateway_approval. The
     # 3-button layout folds "session" into "always"; ``/approve session`` still works.
     _APPROVAL_BUTTON_TO_CHOICE = {"allow-once": "once", "allow-always": "always", "deny": "deny"}
+    _SLASH_CONFIRM_CLICK_LABELS = {"once": "✅ 已批准（本次）", "always": "⭐ 已设为始终批准", "cancel": "🟡 已取消"}
 
     @staticmethod
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
@@ -686,7 +688,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def _default_interaction_dispatch(self, event: InteractionEvent) -> None:
         """Default interaction callback: ``approve:<session_key>:<decision>`` →
         tools.approval.resolve_gateway_approval; ``update_prompt:<answer>`` →
-        ``~/.hermes/.update_response``; anything else is ignored at DEBUG."""
+        ``~/.hermes/.update_response``; ``slash_confirm:<session_key>:<confirm_id>:<choice>`` →
+        tools.slash_confirm.resolve; ``clarify:<session_key>:<clarify_id>:<option>`` →
+        tools.clarify_gateway (``c<idx>`` resolves, ``other`` flips to text capture);
+        anything else is ignored at DEBUG."""
         button_data = event.button_data
         if not button_data:
             return
@@ -709,8 +714,35 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s (choice=%s, operator=%s)",
                     self._log_tag, count, session_key, choice, event.operator_openid)
+                if count == 0:
+                    # Stale card (timeout / session reset / resolved elsewhere): say so — a silent
+                    # no-op reads as a broken button.
+                    await self._send_interaction_ack(
+                        event, "⌛ 该审批已失效：没有待处理的审批（可能已超时未执行，或已在别处处理）。")
             except Exception as exc:
                 logger.error("[%s] resolve_gateway_approval failed for session %s: %s", self._log_tag, session_key, exc)
+            return
+
+        slash_confirm = parse_slash_confirm_button_data(button_data)
+        if slash_confirm is not None:
+            session_key, confirm_id, choice = slash_confirm
+            if not self._is_authorized_interaction_for_session(event, session_key):
+                logger.warning(
+                    "[%s] Rejected unauthorized slash-confirm click for session %s (operator=%s)",
+                    self._log_tag, session_key, event.operator_openid)
+                return
+            await self._resolve_slash_confirm_click(event, session_key, confirm_id, choice)
+            return
+
+        clarify = parse_clarify_button_data(button_data)
+        if clarify is not None:
+            session_key, clarify_id, option = clarify
+            if not self._is_authorized_interaction_for_session(event, session_key):
+                logger.warning(
+                    "[%s] Rejected unauthorized clarify click (clarify=%s, operator=%s)",
+                    self._log_tag, clarify_id, event.operator_openid)
+                return
+            await self._resolve_clarify_click(event, clarify_id, option)
             return
 
         update_answer = parse_update_prompt_button_data(button_data)
@@ -725,6 +757,90 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
 
         logger.debug("[%s] Unrecognised button_data %r from interaction %s", self._log_tag, button_data, event.id)
+
+    @staticmethod
+    def _interaction_chat_id(event: InteractionEvent) -> str:
+        """Chat a button click came from (group > guild > c2c user)."""
+        return str(event.group_openid or event.guild_id or event.user_openid or "").strip()
+
+    async def _send_interaction_ack(self, event: InteractionEvent, text: str) -> None:
+        """Best-effort chat ack for a button click (passive reply; a failure is only logged —
+        the click itself already did its work)."""
+        chat = self._interaction_chat_id(event)
+        if not chat:
+            return
+        try:
+            await self.send(chat_id=chat, content=text, reply_to=self._last_msg_id.get(chat))
+        except Exception as exc:
+            logger.warning("[%s] Interaction ack failed for %s: %s", self._log_tag, chat, exc)
+
+    async def _resolve_clarify_click(self, event: InteractionEvent, clarify_id: str, option: str) -> None:
+        """Resolve a clarify button click. ``c<idx>`` maps back to its choice text via the pending
+        clarify entry (``button_data`` is positional so long UTF-8 choices cannot blow the callback
+        budget); ``other`` flips the entry to text capture, so the next typed message answers it."""
+        try:
+            from tools import clarify_gateway as _clarify_mod  # lazy: keep adapter light
+        except Exception as exc:  # pragma: no cover — import guard only
+            logger.error("[%s] clarify_gateway import failed: %s", self._log_tag, exc)
+            return
+        if option == "other":
+            flipped = False
+            try:
+                flipped = bool(_clarify_mod.mark_awaiting_text(clarify_id))
+            except Exception as exc:
+                logger.warning("[%s] mark_awaiting_text failed: %s", self._log_tag, exc)
+            if flipped:
+                await self._send_interaction_ack(event, "✏️ 请直接输入你的答案（发送文字即可）。")
+            else:
+                await self._send_interaction_ack(event, "⌛ 该问题已失效（已超时或已作答），请让 Hermes 重新提问。")
+            return
+        try:
+            idx = int(option[1:])
+        except (TypeError, ValueError):
+            return
+        choices: List[Any] = []
+        try:
+            entry = _clarify_mod._entries.get(clarify_id)
+            choices = list(getattr(entry, "choices", None) or [])
+        except Exception:
+            choices = []
+        if not 0 <= idx < len(choices):
+            await self._send_interaction_ack(event, "⌛ 该问题已失效（已超时或已作答），请让 Hermes 重新提问。")
+            return
+        resolved = False
+        try:
+            resolved = bool(_clarify_mod.resolve_gateway_clarify(clarify_id, str(choices[idx])))
+        except Exception as exc:
+            logger.error("[%s] resolve_gateway_clarify failed: %s", self._log_tag, exc)
+        logger.info(
+            "[%s] Clarify button %s -> %r (operator=%s, resolved=%s)",
+            self._log_tag, clarify_id, str(choices[idx]), event.operator_openid, resolved)
+
+    async def _resolve_slash_confirm_click(
+        self, event: InteractionEvent, session_key: str, confirm_id: str, choice: str,
+    ) -> None:
+        """Resolve a destructive-slash confirmation click and deliver the handler's result text
+        (the same text the ``/approve`` typed path replies with; the button label stands in when
+        the handler returns nothing, and a stale prompt gets an explicit notice)."""
+        try:
+            from tools import slash_confirm as _slash_confirm_mod  # lazy: keep adapter light
+        except Exception as exc:  # pragma: no cover — import guard only
+            logger.error("[%s] slash_confirm import failed: %s", self._log_tag, exc)
+            return
+        label = self._SLASH_CONFIRM_CLICK_LABELS.get(choice, "已处理")
+        try:
+            pending = _slash_confirm_mod.get_pending(session_key)
+            if not pending or str(pending.get("confirm_id")) != str(confirm_id):
+                await self._send_interaction_ack(event, "⌛ 该确认已失效（可能已超时或已处理），请重新操作。")
+                return
+            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+        except Exception as exc:
+            logger.error("[%s] slash_confirm resolve failed for session %s: %s", self._log_tag, session_key, exc)
+            return
+        logger.info(
+            "[%s] Slash confirm %s -> %s (session=%s, operator=%s)",
+            self._log_tag, confirm_id, choice, session_key, event.operator_openid)
+        await self._send_interaction_ack(event, result_text or label)
 
     @staticmethod
     def _write_update_response(answer: str, operator: str = "") -> None:
@@ -1479,18 +1595,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     # Cross-adapter gateway contract: gateway/run.py detects send_exec_approval /
     # send_update_prompt on the adapter class for button-based approval/update UX.
 
-    _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
-
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Keyboard-card approval (called while the agent blocks on approval); clicks resolve via
         _default_interaction_dispatch. QQ's 3-button keyboard has no session tier and no thread /
         DM targeting, so only the ``always`` choice and the raw command/reason are used."""
+        from gateway.platforms.base_exec_approval import approval_timeout_seconds
         description = prompt.description
         if prompt.smart_denied:
             description += " Owner override applies to this one operation only."
         req = ApprovalRequest(
             session_key=prompt.session_key, title="Execute this command?", description=description,
-            command_preview=prompt.command, timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
+            command_preview=prompt.command, timeout_sec=approval_timeout_seconds(),
             allow_permanent="always" in prompt.choices)
         # QQ requires a msg_id for passive replies; the last inbound id is the natural one.
         return await self.send_approval_request(
@@ -1498,7 +1613,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "", session_key: str = "",
-        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Yes/No update-confirmation prompt; button clicks (``update_prompt:y|n``)
         are written to ``~/.hermes/.update_response`` by the interaction callback."""
         del session_key, metadata  # present for contract parity only.
@@ -1507,6 +1623,46 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return await self.send_with_keyboard(
             chat_id, content, build_update_prompt_keyboard(), reply_to=self._last_msg_id.get(chat_id)
         )
+
+    async def send_slash_confirm(
+        self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Button confirmation for destructive slash commands (``/new``, ``/undo``, …):
+        ``[✅ 批准一次] [⭐ 始终批准] [❌ 取消]``; clicks resolve via
+        ``_default_interaction_dispatch`` → ``tools.slash_confirm.resolve`` and the handler's
+        result text is sent back to the chat. On failure the gateway posts the plain-text
+        prompt (``/approve`` / ``/always`` / ``/cancel``) instead."""
+        del metadata  # present for contract parity only.
+        keyboard = build_slash_confirm_keyboard(session_key, confirm_id)
+        content = f"⚠️ **{title}**\n\n{message}"
+        try:
+            return await self.send_with_keyboard(
+                chat_id, content, keyboard, reply_to=self._last_msg_id.get(chat_id))
+        except Exception as exc:  # send_with_keyboard already catches; belt and braces
+            logger.error("[%s] send_slash_confirm keyboard failed: %s", self._log_tag, exc)
+            return SendResult(success=False, error=str(exc) or type(exc).__name__)
+
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Button clarify: one button per choice plus ``✏️ 其它（直接输入）``; clicks come back as
+        INTERACTION_CREATE decoded by ``parse_clarify_button_data`` and resolved in
+        ``_default_interaction_dispatch``. Typed replies keep working through the gateway
+        text-intercept (numeric picks / exact labels). Open-ended questions and chats without
+        keyboard support fall through to the base numbered-list text; a failed send is returned
+        as-is so the clarify-delivery machinery retries the base text once."""
+        if not choices:
+            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+        keyboard = build_clarify_keyboard(session_key, clarify_id, choices)
+        content = f"❓ {question}\n\n点按钮选择，或直接回复选项编号/文字。"
+        try:
+            return await self.send_with_keyboard(
+                chat_id, content, keyboard, reply_to=self._last_msg_id.get(chat_id))
+        except Exception as exc:  # send_with_keyboard already catches; belt and braces
+            logger.error("[%s] send_clarify keyboard failed: %s", self._log_tag, exc)
+            return SendResult(success=False, error=str(exc) or type(exc).__name__)
 
     def _build_text_body(self, content: str, reply_to: Optional[str] = None) -> Dict[str, Any]:
         msg_seq = self._next_msg_seq(reply_to or "default")
