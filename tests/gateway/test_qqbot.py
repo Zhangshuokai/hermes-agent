@@ -1154,7 +1154,7 @@ class TestBuildClarifyKeyboard:
         rows = kb.content.rows
         assert len(rows) == 4  # 6 choices at two per row + Other
         assert len(rows[0].buttons) == 2
-        assert len(rows[0].buttons[0].render_data.label) <= 27  # clamp + "N. " prefix
+        assert len(rows[0].buttons[0].render_data.label) <= 19  # 16-char clamp + "N. " prefix
         assert rows[-1].buttons[-1].action.data.endswith(":other")
 
     def test_more_than_ten_choices_stay_within_five_rows(self):
@@ -1164,6 +1164,29 @@ class TestBuildClarifyKeyboard:
         assert len(rows) <= 5
         # The Other button shares the last row when all five rows are full.
         assert rows[-1].buttons[-1].action.data.endswith(":other")
+
+    def test_smart_cut_keeps_leading_clause(self):
+        """Long labels cut at the sentence colon so the leading gist stays readable."""
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+        long_choice = ("任务实测对比（推荐）：同一批任务×同一模型两边实跑，统一评分表+评委模型打分 → 报告+对比图")
+        kb = build_clarify_keyboard("s", "id", [long_choice, "乙方案"])
+        assert kb.content.rows[0].buttons[0].render_data.label == "1. 任务实测对比（推荐）"
+        assert kb.content.rows[1].buttons[0].render_data.label == "2. 乙方案"
+
+    def test_tool_recommended_suffix_recompacted_for_display(self):
+        """The tool's '(Recommended)' suffix renders as a compact '（推荐）' marker."""
+        from gateway.platforms.qqbot.keyboards import build_clarify_keyboard
+        kb = build_clarify_keyboard("s", "id", ["甲方案 (Recommended)", "乙方案"])
+        assert kb.content.rows[0].buttons[0].render_data.label == "1. 甲方案（推荐）"
+        assert kb.content.rows[1].buttons[0].render_data.label == "2. 乙方案"
+
+    def test_full_choice_list_helper_only_when_shortened(self):
+        from gateway.platforms.qqbot.keyboards import clarify_full_choice_list
+        assert clarify_full_choice_list(["甲", "乙"]) == ""
+        long_choice = "任务实测对比（推荐）：同一批任务×同一模型两边实跑，统一评分表+评委模型打分 → 报告+对比图"
+        out = clarify_full_choice_list([long_choice, "乙"])
+        assert out.startswith("〔完整选项〕\n1. 任务实测对比")
+        assert "\n2. 乙" in out
 
 
 class TestClarifyAndSlashConfirmDispatch:
@@ -1186,6 +1209,24 @@ class TestClarifyAndSlashConfirmDispatch:
             "group_member_openid": operator,
             "data": {"resolved": {"button_data": button_data}},
         })
+
+    @pytest.mark.asyncio
+    async def test_clarify_send_includes_full_list_when_labels_shortened(self):
+        """Shortened button labels come with the full-text list in the body."""
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_send(chat_id, content, keyboard, reply_to=None, **kwargs):
+            from gateway.platforms.base import SendResult
+            captured["content"] = content
+            return SendResult(success=True)
+
+        adapter.send_with_keyboard = fake_send  # type: ignore[assignment]
+        long_choice = "任务实测对比（推荐）：同一批任务×同一模型两边实跑，统一评分表+评委模型打分 → 报告+对比图"
+        await adapter.send_clarify("u-1", "选哪种？", [long_choice, "乙"], "cid1",
+                                   "agent:main:qqbot:dm:u-1")
+        assert "〔完整选项〕" in captured["content"]
+        assert "1. 任务实测对比（推荐）：" in captured["content"]
 
     @pytest.mark.asyncio
     async def test_clarify_click_resolves_with_choice_text(self):
