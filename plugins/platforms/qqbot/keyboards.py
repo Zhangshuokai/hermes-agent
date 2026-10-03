@@ -136,17 +136,72 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
 
 #: QQ rejects keyboards with more than 5 rows (each row up to 5 buttons).
 _MAX_KEYBOARD_ROWS = 5
-#: Clarify choice buttons carry their text as the label; clamp so mobile rows stay readable.
-_MAX_BUTTON_LABEL = 24
+#: Clarify choice buttons carry their text as the label; hard-clamp so mobile rows stay
+#: readable — anything longer gets a smart cut (leading clause) plus a full-text fallback
+#: list in the message body (see :func:`clarify_full_choice_list`).
+_MAX_BUTTON_LABEL = 16
 #: Choice lists longer than this drop the extra buttons (ten fills five rows of two); the
 #: typed-number reply still reaches every option.
 _MAX_BUTTON_CHOICES = 10
 
+#: Smart-cut separator preference: sentence colon first (keeps the leading gist and any
+#: 「（推荐）」 marker), then dashes, parentheticals, and weak separators.
+_LABEL_CUT_PRIORITY = (("：", ":"), ("——", "—"), ("（", "(", "【", "["),
+                       ("·", "；", ";", "，", ",", "、", "|"))
+_RECOMMENDED_SUFFIX_RE = re.compile(r"\s*\(Recommended\)\s*$")
 
-def _truncate_label(label: str, limit: int = _MAX_BUTTON_LABEL) -> str:
-    """Clamp a button label so long option text cannot blow the mobile row width."""
-    label = str(label).strip()
-    return label if len(label) <= limit else label[: limit - 1].rstrip() + "…"
+
+def _clean_choice_text(text: Any) -> str:
+    """Display-normalize one choice: collapse whitespace, drop markdown noise, and re-express
+    the tool's ``(Recommended)`` suffix as a compact ``（推荐）`` marker (added only when the
+    choice text itself never carries a 推荐 marker already)."""
+    text = re.sub(r"\s+", " ", str(text)).strip().replace("**", "").replace("`", "")
+    if m := _RECOMMENDED_SUFFIX_RE.search(text):
+        text = text[: m.start()].strip()
+        if "推荐" not in text:
+            text = f"{text}（推荐）"
+    return text
+
+
+def _short_label(label: str, limit: int = _MAX_BUTTON_LABEL) -> tuple[str, bool]:
+    """Shorten one display label for a button; returns ``(label, was_shortened)``. Long labels
+    cut at the first separator of the highest available priority so the leading clause survives;
+    with no usable separator they get a hard cut plus an ellipsis."""
+    if len(label) <= limit:
+        return label, False
+    for seps in _LABEL_CUT_PRIORITY:
+        cut = min((i for s in seps if 4 <= (i := label.find(s, 0, limit + 1)) <= limit),
+                  default=None)
+        if cut is not None:
+            return label[:cut].rstrip(), True
+    return label[: limit - 1].rstrip() + "…", True
+
+
+def _display_labels(choices: List[Any]) -> tuple[List[str], bool]:
+    """Short display labels for the button rows plus whether the body needs the full-text list
+    (any label got shortened, or choices were dropped past the button cap). A shortened
+    recommended option keeps its 「（推荐）」 marker so the hint survives the cut."""
+    choices = list(choices)
+    labels, shortened = [], len(choices) > _MAX_BUTTON_CHOICES
+    for i, c in enumerate(choices[:_MAX_BUTTON_CHOICES]):
+        base = _clean_choice_text(c) or f"选项 {i + 1}"
+        short, cut = _short_label(base)
+        if cut and base.endswith("（推荐）") and "推荐" not in short:
+            short = f"{short}（推荐）"
+        shortened = shortened or cut
+        labels.append(short)
+    return labels, shortened
+
+
+def clarify_full_choice_list(choices: List[Any]) -> str:
+    """Numbered full-text list of every choice for the message body; empty string while every
+    button label fits unshortened (nothing needs the fallback then)."""
+    choices = list(choices)
+    if not choices or not _display_labels(choices)[1]:
+        return ""
+    lines = ["〔完整选项〕"]
+    lines += [f"{i + 1}. {_clean_choice_text(c) or f'选项 {i + 1}'}" for i, c in enumerate(choices)]
+    return "\n".join(lines)
 
 
 def build_slash_confirm_keyboard(session_key: str, confirm_id: str) -> InlineKeyboard:
@@ -171,8 +226,7 @@ def build_clarify_keyboard(session_key: str, clarify_id: str, choices: List[Any]
     keyboards at five rows) and shares the last one otherwise.
     """
     prefix = f"{CLARIFY_BUTTON_PREFIX}{session_key}:{clarify_id}"
-    labels = [_truncate_label(str(c).strip() or f"选项 {i + 1}")
-              for i, c in enumerate(list(choices)[:_MAX_BUTTON_CHOICES])]
+    labels, _ = _display_labels(choices)
     per_row = 1 if len(labels) <= 4 else 2
     rows = [
         KeyboardRow(buttons=[
