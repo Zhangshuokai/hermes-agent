@@ -113,13 +113,32 @@ def get_pending_for_session(session_key: str, *, include_choice_prompts: bool = 
         return None
 
 
+def _display_variants(choice: str) -> set[str]:
+    """Casefolded candidates for how a choice may have been SHOWN on a button: the text itself
+    (minus the '(Recommended)' suffix), the compact '（推荐）' marker form, and the smart-cut
+    leading clause the QQ keyboards render."""
+    from tools.clarify_tool import RECOMMENDED_LABEL, strip_recommended
+    raw = str(choice).strip()
+    had_suffix = raw.casefold().endswith(RECOMMENDED_LABEL.casefold())
+    base = strip_recommended(raw)
+    variants = {base.casefold()}
+    if had_suffix and "推荐" not in base:
+        variants.add(f"{base}（推荐）".casefold())
+    for sep in ("：", ":", "——", "—", "（", "("):
+        i = base.find(sep)
+        if i >= 4:
+            variants.add(base[:i].rstrip().casefold())
+    return {v for v in variants if v}
+
+
 def _match_label(text: str, choices: List[str]) -> Optional[str]:
     """Stripped choice text matching ``text`` case-insensitively, ignoring the '(Recommended)'
-    suffix the first choice carries by the time it reaches adapters; None if no match."""
+    suffix the first choice carries by the time it reaches adapters; also accepts the display
+    forms rendered on QQ buttons (smart-cut clause / compact '（推荐）'). None if no match."""
     from tools.clarify_tool import strip_recommended
     wanted = strip_recommended(text).casefold()
     for choice in choices:
-        if strip_recommended(str(choice)).casefold() == wanted:
+        if strip_recommended(str(choice)).casefold() == wanted or wanted in _display_variants(choice):
             return str(choice).strip()
     return None
 

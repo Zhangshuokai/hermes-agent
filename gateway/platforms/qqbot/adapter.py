@@ -73,6 +73,7 @@ from gateway.platforms.qqbot.chunked_upload import (
 from gateway.platforms.qqbot.keyboards import (
     ApprovalRequest, InlineKeyboard, InteractionEvent, build_approval_keyboard,
     build_clarify_keyboard, build_slash_confirm_keyboard, build_update_prompt_keyboard,
+    clarify_full_choice_list,
     parse_approval_button_data, parse_clarify_button_data, parse_interaction_event,
     parse_slash_confirm_button_data, parse_update_prompt_button_data)
 from gateway.platforms._shared import get_scoped_secret as _resolve_qq_secret
@@ -1656,7 +1657,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not choices:
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
         keyboard = build_clarify_keyboard(session_key, clarify_id, choices)
-        content = f"❓ {question}\n\n点按钮选择，或直接回复选项编号/文字。"
+        # Buttons only fit short labels; when any option had to be shortened, the body carries
+        # the full numbered list so mobile users can still read every choice verbatim.
+        full_list = clarify_full_choice_list(choices)
+        hint = "点按钮选择，或直接回复选项编号/文字。"
+        content = f"❓ {question}\n\n{full_list}\n\n{hint}" if full_list else f"❓ {question}\n\n{hint}"
         try:
             return await self.send_with_keyboard(
                 chat_id, content, keyboard, reply_to=self._last_msg_id.get(chat_id))
