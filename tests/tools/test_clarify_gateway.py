@@ -330,6 +330,14 @@ class TestMultiSelectTextFallback:
         entry = cm.register("s4", "sk", "Q?", ["A", "B"])
         assert cm._coerce_text_response(entry, "b") == "B"
 
+    def test_display_short_form_matching(self):
+        """Typed replies accept the shortened forms shown on QQ buttons (smart cut / （推荐）)."""
+        from tools import clarify_gateway as cm
+        full = "任务实测对比（推荐）：同一批任务×同一模型两边实跑 (Recommended)"
+        entry = cm.register("s5", "sk5", "Q?", [full, "乙"])
+        assert cm._coerce_text_response(entry, "任务实测对比（推荐）") == full.strip()
+        assert cm._coerce_text_response(entry, "任务实测对比") == full.strip()
+
 
 class TestNativeRejectClassification:
     """Rejected typed replies must distinguish free prose from bad selections.
